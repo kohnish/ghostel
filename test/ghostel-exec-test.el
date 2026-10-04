@@ -262,6 +262,44 @@ is nil, SIGHUP is ignored."
           (ghostel-test--cleanup-exec-buffer buf))
         (delete-directory dir t)))))
 
+(ert-deftest ghostel-test-native-exec-exit-with-pty-holding-child ()
+  "The native backend reports shell exit while a child still holds the PTY."
+  :tags '(native posix)
+  (skip-unless (file-executable-p "/bin/sh"))
+  (let* ((dir (make-temp-file (expand-file-name "ghostel-life-" default-directory) t))
+         (pid-file (expand-file-name "child-pid" dir))
+         (buf (generate-new-buffer " *ghostel-test-held-pty-exit*"))
+         proc child-pid)
+    (unwind-protect
+        (progn
+          (let ((ghostel-use-native-pty t)
+                (ghostel-kill-buffer-on-exit t))
+            (setq proc
+                  (ghostel-exec
+                   buf "/bin/sh" '("-i")))
+            (with-current-buffer buf
+              (ghostel--write-pty
+               ghostel--term
+               (format "trap '' HUP; sleep 30 & echo $! > %s\n"
+                       (shell-quote-argument pid-file))))
+            (ghostel-test-exec--wait-for-file pid-file proc 5)
+            (setq child-pid
+                  (string-to-number
+                   (with-temp-buffer
+                     (insert-file-contents pid-file)
+                     (buffer-string))))
+            (with-current-buffer buf
+              (ghostel--write-pty ghostel--term "\x04"))
+            (ghostel-test--wait-until
+             (lambda () (not (buffer-live-p buf))) proc 5)
+            (should-not (process-live-p proc))))
+      (ghostel-test-exec--kill-pid child-pid)
+      (when (process-live-p proc)
+        (delete-process proc))
+      (when (buffer-live-p buf)
+        (ghostel-test--cleanup-exec-buffer buf))
+      (delete-directory dir t))))
+
 (ert-deftest ghostel-test-exec-exit-hook-window-delete-keeps-origin-writable ()
   "An exit function deleting the selected window leaves other buffers alone.
 Deleting the selected window switches the current buffer; the sentinel's
