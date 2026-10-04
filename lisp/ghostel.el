@@ -4265,12 +4265,9 @@ writes a final exit status before closing it."
 
     (set-process-sentinel pipe
                           (lambda (process event)
-                            ;; The pipe stands in for the native child process.
-                            ;; If Emacs deletes it before normal exit, make sure
-                            ;; the child is not left running.  After normal exit
-                            ;; the reaper has already waited, so this is a no-op.
-                            (signal-process
-                             (process-get process 'ghostel--native-pid) 9)
+                            (ignore-errors
+                              (signal-process
+                               (process-get process 'ghostel--native-pid) 9))
                             (ghostel--sentinel process event)))
     (add-hook 'kill-buffer-hook #'ghostel--kill-native-process-hook nil t)
     pipe))

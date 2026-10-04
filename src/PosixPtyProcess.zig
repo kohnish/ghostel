@@ -118,6 +118,15 @@ const Pty = struct {
 pty: Pty,
 pid: sys.pid_t = -1,
 wake_pipe: [2]sys.fd_t = .{ -1, -1 },
+exit_watcher: ?*ExitWatcher = null,
+exit_thread: ?std.Thread = null,
+
+const ExitWatcher = struct {
+    pid: sys.pid_t,
+    wake_fd: sys.fd_t,
+    exited: bool = false,
+    exit_code: u32 = 255,
+};
 
 pub const EventWriter = struct {
     pub const Fd = sys.fd_t;
@@ -216,6 +225,9 @@ pub fn init(alloc: Allocator, _: std.Io, size: backend_types.WinSize, params: ba
         _ = sys.close(self.wake_pipe[1]);
     }
 
+    const exit_watcher = try std.heap.page_allocator.create(ExitWatcher);
+    errdefer std.heap.page_allocator.destroy(exit_watcher);
+
     // This is racy but benign. pipe2 would be better but doesn't exist on macOS.
     for (self.wake_pipe) |fd| {
         _ = try fcntl(fd, sys.F.SETFD, sys.FD_CLOEXEC);
@@ -234,6 +246,24 @@ pub fn init(alloc: Allocator, _: std.Io, size: backend_types.WinSize, params: ba
         // This is the parent, child started successfully.
         self.pty.closeReplica();
         self.pid = pid;
+        exit_watcher.* = .{
+            .pid = pid,
+            .wake_fd = self.wake_pipe[1],
+        };
+        self.exit_watcher = exit_watcher;
+        self.exit_thread = std.Thread.spawn(.{}, waitForChild, .{exit_watcher}) catch |err| {
+            self.pty.deinit();
+            _ = sys.kill(pid, .KILL);
+            while (true) {
+                var status: c_int = undefined;
+                switch (sys.errno(sys.waitpid(pid, &status, 0))) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => break,
+                }
+            }
+            return err;
+        };
         return self;
     }
 
@@ -332,20 +362,52 @@ pub fn drain(self: *Self, stream: anytype) !bool {
     if (sys.errno(pollWithRetry(&pollfds, -1)) != .SUCCESS) {
         return error.PollFailed;
     }
-    if (pollfds[1].revents != 0) return false;
+
+    const child_exited = @atomicLoad(
+        bool,
+        &self.exit_watcher.?.exited,
+        .acquire,
+    );
+    if (pollfds[1].revents != 0 and !child_exited) return false;
 
     const eof = pollfds[0].revents & sys.POLL.HUP != 0;
     while (true) {
         const len = sys.read(self.pty.primary_fd, &buf, buf.len);
-        if (len == 0) return !eof;
+        if (len == 0) return !eof and !child_exited;
         switch (sys.errno(len)) {
             .SUCCESS => try stream.nextSlice(buf[0..@intCast(len)]),
             .INTR => continue,
-            .AGAIN => return !eof,
+            .AGAIN => return !eof and !child_exited,
             .BADF, .IO => return false,
             else => return error.ReadFailed,
         }
     }
+}
+
+fn waitForChild(exit_watcher: *ExitWatcher) void {
+    var status: c_int = undefined;
+    while (true) {
+        switch (sys.errno(sys.waitpid(exit_watcher.pid, &status, 0))) {
+            .SUCCESS => {
+                exit_watcher.exit_code = exitStatus(status);
+                break;
+            },
+            .INTR => continue,
+            else => {
+                log.err("ghostel: Failed waiting for child process", .{});
+                exit_watcher.exit_code = 255;
+                break;
+            },
+        }
+    }
+    @atomicStore(bool, &exit_watcher.exited, true, .release);
+    _ = writeWithRetry(exit_watcher.wake_fd, "X");
+}
+
+fn exitStatus(status: c_int) u32 {
+    if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
+    if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
+    return 255;
 }
 
 pub fn finishDrain(_: *Self, _: anytype) !void {}
@@ -363,18 +425,11 @@ pub fn replicaName(self: *Self) []const u8 {
 pub fn deinitAndWait(self: *Self) u32 {
     std.debug.assert(self.pid > 0);
     self.pty.deinit();
+    self.exit_thread.?.join();
+    const exit_watcher = self.exit_watcher.?;
+    const exit_code = exit_watcher.exit_code;
+    std.heap.page_allocator.destroy(exit_watcher);
     _ = sys.close(self.wake_pipe[0]);
     _ = sys.close(self.wake_pipe[1]);
-    while (true) {
-        var status: c_int = undefined;
-        switch (sys.errno(sys.waitpid(self.pid, &status, 0))) {
-            .SUCCESS => {
-                if (c.WIFEXITED(status)) return @intCast(c.WEXITSTATUS(status));
-                if (c.WIFSIGNALED(status)) return @intCast(128 + c.WTERMSIG(status));
-            },
-
-            .INTR => continue,
-            else => return 255,
-        }
-    }
+    return exit_code;
 }
